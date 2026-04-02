@@ -1,0 +1,18 @@
+# AnimTOON - Requirements
+# Install PyTorch CUDA first (RTX 5060 Ti needs nightly):
+#   pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
+#
+# Then install the rest:
+#   pip install -r requirements.txt
+
+transformers>=5.3.0,<6.0.0
+peft>=0.18.0
+datasets>=4.0.0
+accelerate>=1.0.0
+bitsandbytes>=0.45.0
+huggingface_hub>=0.34.0
+sentencepiece>=0.2.0
+tqdm>=4.66.0
+numpy>=1.26.0
+safetensors>=0.4.0
+requests>=2.31.0

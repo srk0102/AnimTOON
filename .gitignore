@@ -1,12 +1,31 @@
+# Python
 __pycache__/
 *.pyc
-.DS_Store
-*.lottie
-*.json
-!manifest.json
-animtoon_train.jsonl
-animtoon_test_*.jsonl
-*.animtoon.txt
+venv*/
+*.egg-info/
+
+# Data (large files, generated)
+data/*.jsonl
+data/*.json
+data/*.lottie
+data/*.parquet
+
+# Outputs (generated)
+outputs/
+
+# Models (large, upload to HuggingFace)
 models/
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets
+.env
+
+# Misc
 wandb/
 .claude/
+*.animtoon.txt
+unsloth_compiled_cache/

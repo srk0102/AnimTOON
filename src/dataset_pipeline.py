@@ -106,7 +106,7 @@ def iter_parquet_files(parquet_paths: list, limit: int = 0) -> Iterator[dict]:
             count += 1
 
 
-def iter_hf_api(subset: str = 'Lottie', limit: int = 100) -> Iterator[dict]:
+def iter_hf_api(subset: str = 'Lottie', limit: int = 100, start_offset: int = 0) -> Iterator[dict]:
     """Fetch rows via HuggingFace datasets-server REST API.
     No dependencies needed beyond urllib. Fast for small batches."""
     import urllib.request
@@ -114,7 +114,7 @@ def iter_hf_api(subset: str = 'Lottie', limit: int = 100) -> Iterator[dict]:
 
     base_url = "https://datasets-server.huggingface.co/rows"
     batch_size = 100  # API max per request
-    offset = 0
+    offset = start_offset
     count = 0
     target = limit if limit > 0 else 999999999
 
@@ -129,13 +129,24 @@ def iter_hf_api(subset: str = 'Lottie', limit: int = 100) -> Iterator[dict]:
         })
         url = f"{base_url}?{params}"
 
-        try:
-            req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.loads(resp.read().decode())
-        except Exception as e:
-            print(f"  API error at offset {offset}: {e}")
-            break
+        data = None
+        for attempt in range(5):
+            try:
+                req = urllib.request.Request(url)
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read().decode())
+                break
+            except Exception as e:
+                if attempt < 4:
+                    wait = 2 ** attempt
+                    print(f"  API error at offset {offset} (retry {attempt+1}/5 in {wait}s): {e}")
+                    time.sleep(wait)
+                else:
+                    print(f"  API failed at offset {offset} after 5 retries: {e}")
+        if data is None:
+            # Skip this batch and try next offset
+            offset += batch_size
+            continue
 
         rows = data.get('rows', [])
         if not rows:
@@ -194,7 +205,7 @@ def run_pipeline(
     os.makedirs(os.path.dirname(os.path.abspath(output_file)) or '.', exist_ok=True)
     t_start = time.time()
 
-    with open(output_file, 'w') as f_out:
+    with open(output_file, 'w', encoding='utf-8') as f_out:
         for sample in data_iter:
             if 0 < limit <= total:
                 break
@@ -282,11 +293,14 @@ if __name__ == "__main__":
                         help='HF subset (default: Lottie)')
     parser.add_argument('--limit', type=int, default=100,
                         help='Max samples to process (0 = all)')
-    parser.add_argument('--output', default='animtoon_train.jsonl',
+    parser.add_argument('--offset', type=int, default=0,
+                        help='Start from this row offset (skip first N samples)')
+    parser.add_argument('--output', default='data/animtoon_train.jsonl',
                         help='Output JSONL file path')
     args = parser.parse_args()
 
     print("=== AnimTOON Dataset Pipeline ===")
+    print(f"Offset: {args.offset}")
     print(f"Limit: {args.limit if args.limit > 0 else 'ALL'}")
     print(f"Output: {args.output}")
 
@@ -302,13 +316,13 @@ if __name__ == "__main__":
         data_iter = iter_parquet_files(files, args.limit)
     elif args.api:
         print(f"Source: HuggingFace REST API ({args.subset})")
-        data_iter = iter_hf_api(args.subset, args.limit)
+        data_iter = iter_hf_api(args.subset, args.limit, args.offset)
     elif args.hf:
         print(f"Source: HuggingFace datasets streaming ({args.subset})")
         data_iter = iter_huggingface(args.subset, args.limit)
     else:
         # Default to API mode — no extra deps needed
         print(f"Source: HuggingFace REST API ({args.subset}) [default]")
-        data_iter = iter_hf_api(args.subset, args.limit)
+        data_iter = iter_hf_api(args.subset, args.limit, args.offset)
 
     run_pipeline(data_iter, args.limit, args.output)

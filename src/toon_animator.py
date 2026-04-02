@@ -1291,7 +1291,7 @@ def run_pipeline(input_path: str, output_path: str):
 
     # Save AnimTOON text for inspection
     txt_path = output_path.replace('.lottie', '.animtoon.txt')
-    with open(txt_path, 'w') as f:
+    with open(txt_path, 'w', encoding='utf-8') as f:
         f.write(animtoon_text)
     print(f"\n  AnimTOON text saved to: {txt_path}")
 
