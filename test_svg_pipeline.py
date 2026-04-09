@@ -223,9 +223,63 @@ def parse_keyframes(prop_line, duration):
 lottie_dict['fr'] = fr
 lottie_dict['op'] = dur
 
-# Update layer timing
 for layer in layers:
     layer['op'] = dur
+
+
+def get_shape_bbox(items):
+    """Calculate bounding box center of a shape group's path data.
+    Returns (cx, cy) in the shape's local coordinate space."""
+    all_x = []
+    all_y = []
+
+    for item in items:
+        ty = item.get('ty')
+
+        if ty == 'sh':
+            # Bezier shape — extract vertices
+            ks = item.get('ks', {})
+            k = ks.get('k', {})
+            if isinstance(k, dict):
+                verts = k.get('v', [])
+                for v in verts:
+                    if isinstance(v, list) and len(v) >= 2:
+                        all_x.append(v[0])
+                        all_y.append(v[1])
+
+        elif ty == 'el':
+            # Ellipse — center is at position, size defines bounds
+            p = item.get('p', {}).get('k', [0, 0])
+            s = item.get('s', {}).get('k', [10, 10])
+            if isinstance(p, list) and len(p) >= 2:
+                if isinstance(s, list) and len(s) >= 2:
+                    all_x.extend([p[0] - s[0]/2, p[0] + s[0]/2])
+                    all_y.extend([p[1] - s[1]/2, p[1] + s[1]/2])
+
+        elif ty == 'rc':
+            # Rectangle
+            p = item.get('p', {}).get('k', [0, 0])
+            s = item.get('s', {}).get('k', [10, 10])
+            if isinstance(p, list) and len(p) >= 2:
+                if isinstance(s, list) and len(s) >= 2:
+                    all_x.extend([p[0] - s[0]/2, p[0] + s[0]/2])
+                    all_y.extend([p[1] - s[1]/2, p[1] + s[1]/2])
+
+        elif ty == 'gr':
+            # Nested group — recurse
+            sub_items = item.get('it', [])
+            sub_cx, sub_cy = get_shape_bbox(sub_items)
+            if sub_cx is not None:
+                all_x.append(sub_cx)
+                all_y.append(sub_cy)
+
+    if all_x and all_y:
+        cx = (min(all_x) + max(all_x)) / 2
+        cy = (min(all_y) + max(all_y)) / 2
+        return round(cx, 2), round(cy, 2)
+
+    return None, None
+
 
 if not animated_layers:
     print("\nNo animations to apply.")
@@ -236,7 +290,6 @@ else:
         shape_groups = layer.get('shapes', [])
 
         for sg_idx, sg in enumerate(shape_groups):
-            # Find the 'tr' (transform) inside this shape group
             items = sg.get('it', [])
             tr = None
             tr_idx = None
@@ -250,13 +303,11 @@ else:
             if tr is None:
                 continue
 
-            # Pick which model animation to apply to this shape group
+            # Pick animation: first N get direct, rest cycle every 3rd
             if sg_idx < len(animated_layers):
                 anim_data = animated_layers[sg_idx]
             elif animated_layers:
-                # For extra shape groups, cycle through animations
-                # But only apply to some (not all — keep some static)
-                if sg_idx % 3 == 0:  # every 3rd shape group gets animation
+                if sg_idx % 3 == 0:
                     anim_data = animated_layers[sg_idx % len(animated_layers)]
                 else:
                     continue
@@ -266,41 +317,50 @@ else:
             if not anim_data:
                 continue
 
-            # Only apply rot, scale, opacity to shape groups — NEVER position
-            # Position at shape group level breaks spatial layout
-            safe_props = {k: v for k, v in anim_data.items() if k in ('rot', 'scale', 'opacity')}
+            # Only rot, scale, opacity — NEVER position
+            safe_props = {k: v for k, v in anim_data.items()
+                          if k in ('rot', 'scale', 'opacity')}
             if not safe_props:
                 continue
 
-            # Apply rotation animation to shape group transform
+            # ── FIX: Set anchor point to BBox center ──
+            # This makes rotation/scale happen around the shape's center
+            # instead of (0,0) which causes parts to fly off
+            cx, cy = get_shape_bbox(items)
+            if cx is not None and cy is not None:
+                # Set anchor to shape center
+                tr['a'] = {"a": 0, "k": [cx, cy]}
+                # Offset position by same amount so shape stays in place
+                old_p = tr.get('p', {}).get('k', [0, 0])
+                if isinstance(old_p, list) and len(old_p) >= 2:
+                    tr['p'] = {"a": 0, "k": [old_p[0] + cx, old_p[1] + cy]}
+                else:
+                    tr['p'] = {"a": 0, "k": [cx, cy]}
+
+            # Apply rotation
             if 'rot' in safe_props:
-                kf = parse_keyframes(anim_data['rot'], dur)
+                kf = parse_keyframes(safe_props['rot'], dur)
                 if kf:
                     tr['r'] = kf
 
-            # Apply scale animation (relative to shape group, not canvas)
-            if 'scale' in anim_data:
-                kf = parse_keyframes(anim_data['scale'], dur)
+            # Apply scale (relative to shape, not canvas)
+            if 'scale' in safe_props:
+                kf = parse_keyframes(safe_props['scale'], dur)
                 if kf:
-                    # Don't multiply by scale_factor — this is relative to shape group
                     for k in kf.get('k', []):
                         if 's' in k and len(k['s']) == 2:
-                            k['s'].append(100)  # add Z
-                    # DON'T apply here — shape group scale is different from layer scale
-                    # Shape group 'tr' uses 's' key directly
+                            k['s'].append(100)
                     tr['s'] = kf
 
-            # Apply opacity animation
-            if 'opacity' in anim_data:
-                kf = parse_keyframes(anim_data['opacity'], dur)
+            # Apply opacity
+            if 'opacity' in safe_props:
+                kf = parse_keyframes(safe_props['opacity'], dur)
                 if kf:
                     tr['o'] = kf
 
-            # DON'T apply position to shape groups — breaks spatial layout
-
             items[tr_idx] = tr
             applied_count += 1
-            print(f"  Applied {list(anim_data.keys())} to shape group {sg_idx}")
+            print(f"  Shape {sg_idx}: anchor=({cx},{cy}) anim={list(safe_props.keys())}")
 
     print(f"\nTotal: {applied_count} shape groups animated")
 
