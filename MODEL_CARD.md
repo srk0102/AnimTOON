@@ -16,9 +16,9 @@ datasets:
 pipeline_tag: text-generation
 ---
 
-# AnimTOON-3B: Token-Efficient Vector Animation Generation
+# AnimTOON-3B (v3): Token-Efficient Vector Animation Generation
 
-**5-7x fewer tokens than OmniLottie (CVPR 2026) for generating Lottie animations.**
+**3-4x fewer tokens than OmniLottie (CVPR 2026) for generating Lottie animations. Now with character animation support.**
 
 | | AnimTOON | OmniLottie |
 |---|---|---|
@@ -137,10 +137,22 @@ The model now works for:
 |-----------|-------|
 | Base Model | Qwen/Qwen2.5-3B-Instruct |
 | Method | LoRA (r=16, alpha=32) merged into base |
+| Version | v3 (final 3B Lite release) |
 | Training Data | 99,650 (MMLottie-2M) + 10,000 (layer-aware) + 984 (Spine/DragonBones) |
 | Hardware | 1x NVIDIA RTX 5060 Ti (16GB) |
 | Framework | Unsloth |
 | Token Reduction | 98.8% vs raw Lottie JSON |
+
+## Architecture: Why Animation-Only is Better
+
+> "Asking one model to draw AND animate is like asking one person to paint AND dance at the same time."
+
+AnimTOON separates concerns:
+- **SVG provides shapes** (perfect, no hallucination, 0 tokens)
+- **Model generates animation** (focused, token-efficient)
+- **Converter merges them** (deterministic, 100% valid output)
+
+OmniLottie generates everything in one model → hallucinated shapes, token bloat (2001 tokens for a "crab" that looks like binoculars).
 
 ## Links
 
