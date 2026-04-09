@@ -107,7 +107,7 @@ inputs = m_tokenizer(text_input, return_tensors='pt').to('cuda')
 
 start = time.time()
 with torch.no_grad():
-    out = m_model.generate(**inputs, max_new_tokens=1024, temperature=0.5, do_sample=True)
+    out = m_model.generate(**inputs, max_new_tokens=1024, do_sample=False)
 t = time.time() - start
 
 text = m_model = None  # free GPU memory
