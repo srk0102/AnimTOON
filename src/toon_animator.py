@@ -489,9 +489,10 @@ class AnimTOONToLottie:
         return layer
 
     def _parse_keyframes(self, data: str) -> tuple:
-        """Parse keyframe string. Supports both formats:
+        """Parse keyframe string. Supports formats:
         - v3 float: '0.0→[0.5,0.5] 0.5→[0.8,0.3] ease=smooth'
         - v4 int:   '0→[500,500] 500→[800,300] ease=smooth'
+        - v4 loop:  'loop=500 +5 -5 ease=smooth' (repeating delta pattern)
         Auto-detects format. Returns (keyframes_list, ease_type)
         Time values always normalized to 0.0-1.0 range."""
         if not data:
@@ -501,6 +502,39 @@ class AnimTOONToLottie:
         ease = ease_match.group(1) if ease_match else 'none'
 
         kf_str = re.sub(r'\s*ease=\w+', '', data).strip()
+
+        # Check for loop pattern: "loop=500 +5 -5" or "loop=250 +10 -10 +10 -10"
+        loop_match = re.match(r'loop=(\d+)\s+([\d+\-.\s]+)', kf_str)
+        if loop_match:
+            cycle_frames = int(loop_match.group(1))
+            deltas_str = loop_match.group(2).strip().split()
+            deltas = [float(d) for d in deltas_str]
+
+            # Build keyframes from loop pattern
+            keyframes = []
+            num_deltas = len(deltas)
+            step = cycle_frames / (num_deltas + 1) if num_deltas > 0 else cycle_frames
+            val = 0
+            keyframes.append((0.0, val))
+            for i, d in enumerate(deltas):
+                val += d
+                t = (i + 1) * step / 1000.0
+                keyframes.append((round(t, 3), round(val, 1)))
+            # Return to start
+            keyframes.append((cycle_frames / 1000.0, 0))
+
+            # Repeat to fill duration
+            full_kfs = []
+            cycle_t = cycle_frames / 1000.0
+            repeats = int(1.0 / cycle_t) + 1 if cycle_t > 0 else 1
+            for r in range(repeats):
+                offset = r * cycle_t
+                for t, v in keyframes:
+                    new_t = round(offset + t, 3)
+                    if new_t <= 1.0:
+                        full_kfs.append((new_t, v))
+
+            return full_kfs, ease if ease != 'none' else 'smooth'
 
         keyframes = []
         pattern = r'([\d.]+)\u2192(\[[\d.,\s-]+\]|[\d.\-]+)'
