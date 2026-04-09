@@ -1,169 +1,182 @@
-"""Test full SVG → animated Lottie pipeline."""
+"""Test full SVG -> animated Lottie pipeline.
+Applies model animations to individual shape groups within SVG layers.
+"""
 import sys
 import os
 import json
 import copy
+import re
+import time
 
 sys.path.insert(0, 'src')
-os.environ['CUDA_VISIBLE_DEVICES'] = ''
 
-# Step 1: Use python-lottie for perfect SVG to Lottie
+# ============================================================
+# Step 1: Convert SVG to Lottie using python-lottie
+# ============================================================
 from lottie import parsers
+import xml.etree.ElementTree as ET
 
 svg_file = sys.argv[1] if len(sys.argv) > 1 else 'inputs/apple.svg'
 print(f"SVG: {svg_file}")
+
 anim = parsers.svg.parse_svg_file(svg_file)
 
-# Let python-lottie handle the SVG at its native size
-# Then we scale the entire output to 512x512
-import xml.etree.ElementTree as ET
+# Get viewBox for scaling
 tree = ET.parse(svg_file)
 root = tree.getroot()
+ns = ''
+if root.tag.startswith('{'):
+    ns = root.tag.split('}')[0] + '}'
 viewbox = root.get('viewBox', '0 0 512 512')
 vb = [float(x) for x in viewbox.split()]
-vb_w, vb_h = vb[2], vb[3]
+vb_x, vb_y, vb_w, vb_h = vb[0], vb[1], vb[2], vb[3]
 scale_factor = 512 / max(vb_w, vb_h) * 100
 
-# Set animation size to match viewBox so paths align
+# Set native size for path alignment
 anim.width = vb_w
 anim.height = vb_h
 
 lottie_dict = anim.to_dict()
 
-# Now scale canvas to 512x512 and add a wrapper transform
+# Scale canvas to 512x512
 lottie_dict['w'] = 512
 lottie_dict['h'] = 512
 
-# Scale each layer's transform to fit 512x512
+# Scale layer transform to fit canvas (this stays static)
 for layer in lottie_dict.get('layers', []):
     ks = layer.get('ks', {})
-    # Set default scale to fit canvas
     ks['s'] = {"a": 0, "k": [scale_factor, scale_factor, 100]}
-    # Center the layer
     ks['p'] = {"a": 0, "k": [256, 256, 0]}
-    ks['a'] = {"a": 0, "k": [vb_w/2, vb_h/2, 0]}
+    ks['a'] = {"a": 0, "k": [vb_w / 2, vb_h / 2, 0]}
     layer['ks'] = ks
 
-# Split single layer with multiple shape groups into separate layers
-original_layers = lottie_dict.get('layers', [])
-layers = []
+# Count shape groups across all layers
+layers = lottie_dict.get('layers', [])
+all_shape_groups = []
+for layer in layers:
+    for sg in layer.get('shapes', []):
+        all_shape_groups.append((layer, sg))
 
-for orig_layer in original_layers:
-    shapes = orig_layer.get('shapes', [])
-    if len(shapes) > 1:
-        for i, shape in enumerate(shapes):
-            new_layer = copy.deepcopy(orig_layer)
-            new_layer['shapes'] = [shape]
-            new_layer['nm'] = f"Part_{i+1}"
-            new_layer['ind'] = len(layers) + 1
-            # Scale layer to fit 512x512
-            ks = new_layer.get('ks', {})
-            ks['s'] = {"a": 0, "k": [scale_factor, scale_factor, 100]}
-            new_layer['ks'] = ks
-            layers.append(new_layer)
-    else:
-        orig_layer.get('ks', {})['s'] = {"a": 0, "k": [scale_factor, scale_factor, 100]}
-        layers.append(orig_layer)
+shape_count = len(all_shape_groups)
+print(f"SVG: {len(layers)} layers, {shape_count} shape groups")
 
-lottie_dict['layers'] = layers
-
-with open('outputs/robot_static.json', 'w') as f:
-    json.dump(lottie_dict, f, indent=2)
-
-print(f"SVG converted: {len(layers)} layers (split from shape groups)")
-for i, layer in enumerate(layers):
-    print(f"  Layer {i}: {layer.get('nm', 'unnamed')}")
-
-# Step 2: Use a prompt that matches training data format
+# ============================================================
+# Step 2: Build prompt
+# ============================================================
 from prompt_builder import build_prompt_with_svg_info
 _, elements = build_prompt_with_svg_info(svg_file, 'entrance')
 
-# Build layer-aware prompt for the new model
-prompt = (
-    "A cyan-colored elongated shape resembling a smiley face. "
-    "The shape rotates gradually around its horizontal axis, "
-    "revealing small animated sparkles near the eyes, "
-    "enhancing the dynamic visual effect."
-)
+if shape_count > 20:
+    prompt = (
+        f"A character with {shape_count} parts performing an idle animation. "
+        "Animate key parts only: eyes blink (scale Y 100->10->100), "
+        "arms/claws rotate gently (rot +/-15), body breathes (scale 100->102->100), "
+        "head bobs (pos Y shifts). Keep other parts static. "
+        "Use sparse keyframes (3-5 per property). "
+        f"Generate animation for {min(shape_count, 15)} most important parts."
+    )
+elif shape_count > 3:
+    prompt = (
+        f"A character with {shape_count} body parts performing an idle animation. "
+        "Use sparse keyframes (3-5 per property). "
+        "Animate all parts with coordinated subtle movement, head bobbing, and body sway."
+    )
+else:
+    prompt = (
+        "A shape performing a smooth bounce entrance and gentle pulse animation. "
+        "Use sparse keyframes (3-5 per property)."
+    )
+
 print(f"\nPrompt: {prompt[:200]}...")
 
-# Step 3: Load model and generate animations
-from test_inference import load_model, generate_animtoon
+# ============================================================
+# Step 3: Generate animation with model
+# ============================================================
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-checkpoint = 'models/animtoon-3b-layers/checkpoint-1400'
-# Find latest checkpoint
-ckpt_dir = 'models/animtoon-3b-layers'
-ckpts = [d for d in os.listdir(ckpt_dir) if d.startswith('checkpoint-')]
-if ckpts:
-    latest = sorted(ckpts, key=lambda x: int(x.split('-')[1]))[-1]
-    checkpoint = os.path.join(ckpt_dir, latest)
-    print(f"Using latest checkpoint: {checkpoint}")
+print("Loading model...")
+m_tokenizer = AutoTokenizer.from_pretrained('models/animtoon-3b-v3-merged')
+m_model = AutoModelForCausalLM.from_pretrained(
+    'models/animtoon-3b-v3-merged', dtype=torch.float16, device_map='cuda'
+)
 
-model, tokenizer = load_model(checkpoint, 'models/animtoon-3b-merged')
-text, t = generate_animtoon(model, tokenizer, prompt, max_new_tokens=1024)
-print("\nMODEL OUTPUT:")
-print(text)
+messages = [{'role': 'user', 'content': f'Generate AnimTOON animation: {prompt}'}]
+text_input = m_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+inputs = m_tokenizer(text_input, return_tensors='pt').to('cuda')
 
-# Step 4: Parse model animations and inject into Lottie JSON
-# Handle both real arrow and mojibake versions
+start = time.time()
+with torch.no_grad():
+    out = m_model.generate(**inputs, max_new_tokens=1024, temperature=0.5, do_sample=True)
+t = time.time() - start
+
+text = m_model = None  # free GPU memory
+text_out = m_tokenizer.decode(out[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+gen_tokens = out[0].shape[0] - inputs['input_ids'].shape[1]
+del m_model, out, inputs
+torch.cuda.empty_cache()
+
+print(f"\nMODEL OUTPUT ({gen_tokens} tokens, {t:.1f}s):")
+print(text_out)
+
+# ============================================================
+# Step 4: Parse model animations
+# ============================================================
 arrow = "\u2192"
 
+
 def has_arrow(line):
-    # Check for real arrow, mojibake, or the pattern time→value
     if arrow in line:
         return True
-    # Check for any arrow-like pattern: number followed by non-ascii then number/bracket
-    import re
     return bool(re.search(r'\d[^\x00-\x7F]+[\d\[\-]', line))
 
+
 def normalize_arrows(line):
-    # Replace any non-ascii sequence between digits that looks like an arrow
-    import re
-    # Find the actual mojibake bytes in the string
     result = line
     for match in re.finditer(r'(\d(?:\.\d+)?)\s*([^\x00-\x7F]+)\s*([\d\[\-])', line):
-        bad_arrow = match.group(2)
-        result = result.replace(bad_arrow, arrow)
+        result = result.replace(match.group(2), arrow)
     return result
 
-# Collect ALL model layers (including static) to preserve index mapping
-layer_anims = []
-current_anims = {}
+
+# Parse all model layers
+model_layers = []
+current = {}
 in_layer = False
 dur = 120
 fr = 30
 
-for line in text.split('\n'):
+for line in text_out.split('\n'):
     line = line.strip()
     if line.startswith('anim '):
         for p in line.split():
             if p.startswith('dur='): dur = int(p[4:])
             if p.startswith('fr='): fr = int(p[3:])
-    elif line.startswith('layer '):
+    elif line.startswith('layer'):
         if in_layer:
-            layer_anims.append(current_anims)
-        current_anims = {}
+            model_layers.append(current)
+        current = {}
         in_layer = True
     elif in_layer and has_arrow(line) and '{' not in line:
         normalized = normalize_arrows(line)
         prop = normalized.split()[0]
-        current_anims[prop] = normalized
+        current[prop] = normalized
 
 if in_layer:
-    layer_anims.append(current_anims)
+    model_layers.append(current)
 
-animated = sum(1 for a in layer_anims if a)
-print(f"\nModel: {len(layer_anims)} layers, {animated} animated")
-for i, a in enumerate(layer_anims):
+# Only keep animated layers
+animated_layers = [a for a in model_layers if a]
+print(f"\nModel: {len(model_layers)} layers, {len(animated_layers)} animated")
+for i, a in enumerate(model_layers):
     print(f"  Layer {i}: {list(a.keys()) if a else 'static'}")
 
-# Step 5: Apply animations to Lottie layers
-import re
 
-def parse_keyframes(prop_line, dur):
-    """Convert AnimTOON keyframe line to Lottie keyframes."""
+# ============================================================
+# Step 5: Build keyframes
+# ============================================================
+def parse_keyframes(prop_line, duration):
+    """Convert AnimTOON property line to Lottie keyframe dict."""
     parts = prop_line.strip().split()
-
     ease = "smooth"
     remaining = ' '.join(parts[1:])
     if 'ease=' in remaining:
@@ -178,7 +191,7 @@ def parse_keyframes(prop_line, dur):
 
     keyframes = []
     for time_str, val_str in kf_pairs:
-        frame = round(float(time_str) * dur)
+        frame = round(float(time_str) * duration)
         if val_str.startswith('['):
             vals = [float(v) for v in val_str.strip('[]').split(',')]
         else:
@@ -190,7 +203,11 @@ def parse_keyframes(prop_line, dur):
             ix, iy, ox, oy = [0.667], [1], [0.333], [0]
 
         n = len(vals)
-        kf = {"t": frame, "s": vals, "i": {"x": ix * n, "y": iy * n}, "o": {"x": ox * n, "y": oy * n}}
+        kf = {
+            "t": frame, "s": vals,
+            "i": {"x": ix * n, "y": iy * n},
+            "o": {"x": ox * n, "y": oy * n}
+        }
         keyframes.append(kf)
 
     if keyframes:
@@ -200,56 +217,99 @@ def parse_keyframes(prop_line, dur):
     return {"a": 1, "k": keyframes}
 
 
-# Get dur/fr from model output or defaults
-dur = 120
-fr = 30
-for line in text.split('\n'):
-    if line.strip().startswith('anim '):
-        for p in line.strip().split():
-            if p.startswith('dur='):
-                dur = int(p[4:])
-            if p.startswith('fr='):
-                fr = int(p[3:])
-
-# Update Lottie timing
+# ============================================================
+# Step 6: Apply animations to shape group transforms
+# ============================================================
 lottie_dict['fr'] = fr
 lottie_dict['op'] = dur
 
-# Apply animations to matching layers
-for i, layer in enumerate(layers):
+# Update layer timing
+for layer in layers:
     layer['op'] = dur
-    if i < len(layer_anims):
-        anims = layer_anims[i]
-        ks = layer.get('ks', {})
 
-        for prop, prop_line in anims.items():
-            kf = parse_keyframes(prop_line, dur)
-            if not kf:
+if not animated_layers:
+    print("\nNo animations to apply.")
+else:
+    applied_count = 0
+
+    for layer in layers:
+        shape_groups = layer.get('shapes', [])
+
+        for sg_idx, sg in enumerate(shape_groups):
+            # Find the 'tr' (transform) inside this shape group
+            items = sg.get('it', [])
+            tr = None
+            tr_idx = None
+
+            for idx, item in enumerate(items):
+                if item.get('ty') == 'tr':
+                    tr = item
+                    tr_idx = idx
+                    break
+
+            if tr is None:
                 continue
 
-            if prop == 'opacity':
-                ks['o'] = kf
-            elif prop == 'rot':
-                ks['r'] = kf
-            elif prop == 'scale':
-                for k in kf.get('k', []):
-                    if 's' in k and len(k['s']) == 2:
-                        k['s'].append(100)
-                    # Multiply by base scale factor so [100,100] = full canvas size
-                    if 's' in k:
-                        k['s'] = [round(v * scale_factor / 100, 2) for v in k['s']]
-                ks['s'] = kf
-            elif prop == 'pos':
-                for k in kf.get('k', []):
-                    if 's' in k and len(k['s']) >= 2:
-                        k['s'] = [round(k['s'][0] * 512, 2), round(k['s'][1] * 512, 2), 0]
-                ks['p'] = kf
+            # Pick which model animation to apply to this shape group
+            if sg_idx < len(animated_layers):
+                anim_data = animated_layers[sg_idx]
+            elif animated_layers:
+                # For extra shape groups, cycle through animations
+                # But only apply to some (not all — keep some static)
+                if sg_idx % 3 == 0:  # every 3rd shape group gets animation
+                    anim_data = animated_layers[sg_idx % len(animated_layers)]
+                else:
+                    continue
+            else:
+                continue
 
-        layer['ks'] = ks
-        print(f"  Applied {list(anims.keys())} to Layer {i}")
+            if not anim_data:
+                continue
 
-# Save as .lottie
+            # Only apply rot, scale, opacity to shape groups — NEVER position
+            # Position at shape group level breaks spatial layout
+            safe_props = {k: v for k, v in anim_data.items() if k in ('rot', 'scale', 'opacity')}
+            if not safe_props:
+                continue
+
+            # Apply rotation animation to shape group transform
+            if 'rot' in safe_props:
+                kf = parse_keyframes(anim_data['rot'], dur)
+                if kf:
+                    tr['r'] = kf
+
+            # Apply scale animation (relative to shape group, not canvas)
+            if 'scale' in anim_data:
+                kf = parse_keyframes(anim_data['scale'], dur)
+                if kf:
+                    # Don't multiply by scale_factor — this is relative to shape group
+                    for k in kf.get('k', []):
+                        if 's' in k and len(k['s']) == 2:
+                            k['s'].append(100)  # add Z
+                    # DON'T apply here — shape group scale is different from layer scale
+                    # Shape group 'tr' uses 's' key directly
+                    tr['s'] = kf
+
+            # Apply opacity animation
+            if 'opacity' in anim_data:
+                kf = parse_keyframes(anim_data['opacity'], dur)
+                if kf:
+                    tr['o'] = kf
+
+            # DON'T apply position to shape groups — breaks spatial layout
+
+            items[tr_idx] = tr
+            applied_count += 1
+            print(f"  Applied {list(anim_data.keys())} to shape group {sg_idx}")
+
+    print(f"\nTotal: {applied_count} shape groups animated")
+
+# ============================================================
+# Step 7: Save output
+# ============================================================
 import zipfile
+
+out_name = os.path.splitext(os.path.basename(svg_file))[0]
 
 lottie_json = json.dumps(lottie_dict, separators=(',', ':'))
 manifest = json.dumps({
@@ -258,15 +318,13 @@ manifest = json.dumps({
     "animations": [{"id": "anim_0", "speed": 1, "loop": True, "autoplay": True}]
 }, separators=(',', ':'))
 
-with zipfile.ZipFile('outputs/' + os.path.splitext(os.path.basename(svg_file))[0] + '.lottie', 'w', zipfile.ZIP_DEFLATED) as zf:
+with zipfile.ZipFile(f'outputs/{out_name}.lottie', 'w', zipfile.ZIP_DEFLATED) as zf:
     zf.writestr("manifest.json", manifest)
     zf.writestr("animations/anim_0.json", lottie_json)
 
-# Also save raw JSON for preview
-with open('outputs/' + os.path.splitext(os.path.basename(svg_file))[0] + '.json', 'w') as f:
+with open(f'outputs/{out_name}.json', 'w') as f:
     json.dump(lottie_dict, f, indent=2)
 
-out_name = os.path.splitext(os.path.basename(svg_file))[0]
 print(f"\nSaved: outputs/{out_name}.lottie")
 print(f"Saved: outputs/{out_name}.json")
 print(f"Generation time: {t:.1f}s")
